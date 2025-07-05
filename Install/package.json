@@ -1,0 +1,44 @@
+{
+	"name" : "AccountingTransactions",
+	"display_name" : "Accounting Transactions",
+	"description" : "<p>Accounting transactions package to manage transactions for different accounts</p>",
+	"module_type" : "packages",
+	"app_type" : "fintech",
+	"category" : "tools",
+	"version" : "0.0.0",
+	"repo" : "https://github.com/sp-fintech/fintech-packages-tools-accountingtransactions",
+	"class" : "Apps\\Fintech\\Packages\\Accounting\\Transactions\\AccountingTransactions",
+	"dependencies" : 
+	{
+		"core" : 
+		{
+			"name" : "Core",
+			"version" : "0.0.0-rc.14",
+			"repo" : "https://github.com/sp-framework/core"
+		},
+		"apptype" : 
+		{
+			"name" : "Fintech",
+			"version" : "0.3.0",
+			"repo" : "https://github.com/sp-fintech/fintech"
+		},
+		"packages" : [],
+		"middlewares" : [],
+		"externals" : 
+		{
+			"composer" : 
+			{
+				"require" : []
+			},
+			"config" : 
+			{
+				"allow-plugins" : []
+			},
+			"extra" : 
+			{
+				"patches" : []
+			}
+		}
+	},
+	"settings" : []
+}
