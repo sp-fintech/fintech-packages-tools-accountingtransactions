@@ -3,6 +3,7 @@
 namespace Apps\Fintech\Packages\Accounting\Transactions;
 
 use Apps\Fintech\Packages\Accounting\Accounts\Model\AppsFintechAccountingAccounts;
+use Apps\Fintech\Packages\Accounting\Books\AccountingBooks;
 use Apps\Fintech\Packages\Accounting\Transactions\Model\AppsFintechAccountingTransactions;
 use System\Base\BasePackage;
 
@@ -236,7 +237,38 @@ class AccountingTransactions extends BasePackage
         $accountingtransaction = array_merge($accountingtransaction, $data);
 
         if ($this->update($accountingtransaction)) {
-            if (!isset($data['status'])) {
+            if (isset($data['status'])) {
+                $this->getAccountTransactions($data);
+
+                return true;
+            } else {
+                if ($accountingtransaction['has_splits']) {
+                    $accountingSplitTransactions = $this->getAccountTransactions([
+                        'book_id'           => $data['book_id'],
+                        'accounts_uuid'     => $data['accounts_uuid'],
+                        'transaction_uuid'  => $accountingtransaction['uuid'],
+                        'is_split'          => 'true',
+                    ]);
+
+                    if (isset($accountingSplitTransactions['transactions']) &&
+                        count($accountingSplitTransactions['transactions']) > 0
+                    ) {
+                        foreach ($accountingSplitTransactions['transactions'] as $splitTransactionId => $splitTransaction) {
+                            $splitTransaction['date'] = $data['date'];
+
+                            if (!$this->update($splitTransaction)) {
+                                $this->addResponse('Error updating split transaction', 1);
+
+                                return false;
+                            }
+                        }
+                    }
+
+                    $this->getAccountTransactions($data);
+
+                    return true;
+                }
+
                 if (isset($data['is_split']) && isset($data['split_id'])) {
                     $data['transaction_uuid'] = $accountingtransaction['uuid'];
                 }
@@ -321,8 +353,22 @@ class AccountingTransactions extends BasePackage
 
     public function reconcileAccountingTransactions($data)
     {
-        $data['is_split'] = false;
-        $data['not_reconciled'] = true;
+        $data['is_split'] = 'false';
+        $data['not_reconciled'] = 'true';
+        $bookPackage = $this->usePackage(AccountingBooks::class);
+
+        $book = $bookPackage->getAccountingBookById((int) $data['book_id']);
+
+        if (!$book) {
+            $this->addResponse('Book with ID not found', 1);
+
+            return false;
+        }
+
+        $reconciledBalance = 0;
+        if (isset($book['accounts'][$data['accounts_uuid']]['last_reconciled_balance'])) {
+            $reconciledBalance = $book['accounts'][$data['accounts_uuid']]['last_reconciled_balance'];
+        }
 
         $transactionsArr = $this->getAccountTransactions($data);
 
@@ -345,8 +391,7 @@ class AccountingTransactions extends BasePackage
 
             if (count($transactions) > 0) {
                 $endingBalance = (float) $data['reconcile_ending_balance'];
-                $difference = (float) $data['reconcile_ending_balance'];
-                $reconciledBalance = 0;
+                $difference = (float) $endingBalance - $reconciledBalance;
 
                 foreach ($transactions as $transaction) {
                     if ($transaction['cr_accounts_uuid'] === $data['accounts_uuid']) {
@@ -373,11 +418,15 @@ class AccountingTransactions extends BasePackage
                 foreach ($transactions as $transaction) {
                     $transaction['status'] = 'r';
 
-                    $this->updateAccountingTransaction($transaction);
+                    $this->update($transaction);
                 }
 
                 unset($data['not_reconciled']);
-
+                unset($data['reconcile_date']);
+                unset($data['reconcile_ending_balance']);
+                unset($data['transaction_ids']);
+                $data['is_split'] = 'false';
+                // trace([$data]);
                 $this->getAccountTransactions($data);
 
                 return true;
@@ -493,36 +542,50 @@ class AccountingTransactions extends BasePackage
                 'transactions' => [],
                 'count' => 0,
                 'balance' => 0,
+                'unreconciled_balance' => 0,
+                'last_reconciled_date' => null,
+                'last_reconciled_balance' => 0,
                 'balances' => [],
             ];
 
         // trace([$data, $transactionsArr]);
+
         if ($transactionsArr && count($transactionsArr) > 0) {
             $balance = 0;
+            $unreconciledBalance = 0;
 
             $transactions = [];
-
-            if (!isset($data['transaction_uuid']) && !isset($data['not_reconciled']) && (isset($data['is_split']) && $data['is_split'] == 'false')) {
+            // trace([$data]);
+            if (!isset($data['transaction_uuid']) &&
+                // !isset($data['not_reconciled']) &&
+                (isset($data['is_split']) && $data['is_split'] == 'false')
+            ) {
+                // trace([$data, $transactionsArr]);
                 $balances = [];
+                $lastReconciledDate = null;
+                $lastReconciledBalance = 0;
+                $transactionType = null;
+
                 // trace([$transactionsArr]);
                 foreach ($transactionsArr as $transactionKey => $transaction) {
-                    if ($transaction['attachments'] && count($transaction['attachments']) > 0) {
-                        $attachments = [];
+                    if (!isset($data['not_reconciled'])) {
+                        if ($transaction['attachments'] && count($transaction['attachments']) > 0) {
+                            $attachments = [];
 
-                        foreach ($transaction['attachments'] as $attachmentUUID) {
-                            $attachments[$attachmentUUID] = $this->basepackages->storages->getFileInfo($attachmentUUID);
+                            foreach ($transaction['attachments'] as $attachmentUUID) {
+                                $attachments[$attachmentUUID] = $this->basepackages->storages->getFileInfo($attachmentUUID);
+                            }
+
+                            if (count($attachments) > 0) {
+                                $transaction['attachments'] = $attachments;
+                            } else {
+                                $transaction['attachments'] = null;
+                            }
                         }
-
-                        if (count($attachments) > 0) {
-                            $transaction['attachments'] = $attachments;
-                        } else {
-                            $transaction['attachments'] = null;
-                        }
-                    }
-
-                    if ($transaction['is_split']) {
-                        if ($transaction['dr_accounts_uuid'] !== $data['accounts_uuid']) {
-                            continue;
+                        if ($transaction['is_split']) {
+                            if ($transaction['dr_accounts_uuid'] !== $data['accounts_uuid']) {
+                                continue;
+                            }
                         }
                     }
 
@@ -530,8 +593,9 @@ class AccountingTransactions extends BasePackage
                         $transaction['cr_accounts_uuid'] === 'split'
                     ) {
                         $transaction['balance'] = $balance = numberFormatPrecision($balance + $transaction['amount']);
+                        $transactionType = 'dr';
 
-                        if ($transaction['cr_accounts_uuid'] === 'split') {
+                        if (!isset($data['not_reconciled']) && $transaction['cr_accounts_uuid'] === 'split') {
                             $data['transaction_uuid'] = $transaction['uuid'];
                             $data['is_split'] = 'true';
                             $transaction['splits'] = $this->getAccountTransactions($data);
@@ -553,8 +617,9 @@ class AccountingTransactions extends BasePackage
                                $transaction['dr_accounts_uuid'] === 'split'
                     ) {
                         $transaction['balance'] = $balance = numberFormatPrecision($balance - $transaction['amount']);
+                        $transactionType = 'cr';
 
-                        if ($transaction['dr_accounts_uuid'] === 'split') {
+                        if (!isset($data['not_reconciled']) && $transaction['dr_accounts_uuid'] === 'split') {
                             $data['transaction_uuid'] = $transaction['uuid'];
                             $data['is_split'] = 'true';
                             $transaction['splits'] = $this->getAccountTransactions($data);
@@ -587,10 +652,44 @@ class AccountingTransactions extends BasePackage
                         $balances[$transaction['date']] = $transaction['balance'];
                     }
 
-                    $transactions[$transaction['id']] = $transaction;
+                    $transactions['"' . $transaction['id'] . '"'] = $transaction;//Quotes will maintain the sequence, else json will sort it again in JS
+
+                    if ($transaction['status'] !== 'r') {
+                        $unreconciledBalance += $transaction['amount'];
+                    } else {
+                        $lastReconciledDate = $transaction['date'];
+                        if ($transactionType === 'dr') {
+                            $lastReconciledBalance += $transaction['amount'];
+                        } else if ($transactionType === 'cr') {
+                            $lastReconciledBalance -= $transaction['amount'];
+                        }
+                    }
                 }
-                // trace([$data, $transactions]);
+
+                if (!isset($data['not_reconciled']) && count($balances) > 0) {
+                    $lastDateOfBalance = \Carbon\Carbon::parse($this->helper->lastKey($balances));
+                    $today = \Carbon\Carbon::now();
+                    if ($today->gt($lastDateOfBalance)) {
+                        $startEndDates = (\Carbon\CarbonPeriod::between($this->helper->lastKey($balances), $today->toDateString()))->toArray();
+
+                        if (count($startEndDates) >= 2) {
+                            foreach ($startEndDates as $startEndDateKey => $startEndDate) {
+                                if ($startEndDateKey === 0) {
+                                    continue;
+                                }
+                                $balances[$startEndDate->toDateString()] = $this->helper->last($balances);
+                            }
+                        }
+                    }
+                }
+
+                // if (!isset($data['not_reconciled'])) {
+                    // trace([$transactions]);
+                // }
                 $responseData['balance'] = $balance;
+                $responseData['unreconciled_balance'] = $unreconciledBalance;
+                $responseData['last_reconciled_date'] = $lastReconciledDate;
+                $responseData['last_reconciled_balance'] = $lastReconciledBalance;
                 $responseData['balances'] = $balances;
                 $responseData['transactions'] = $transactions;
 
@@ -605,7 +704,9 @@ class AccountingTransactions extends BasePackage
                 }
 
                 if ($accounts) {
-                    $accounts['balance'] = $balance;
+                    $accounts['balance'] = $responseData['balance'];
+                    $accounts['last_reconciled_date'] = $lastReconciledDate;
+                    $accounts['last_reconciled_balance'] = $lastReconciledBalance;
 
                     if ($this->config->databasetype === 'db') {
                         $accountsModel->assign($accounts);
@@ -623,7 +724,7 @@ class AccountingTransactions extends BasePackage
                 foreach ($transactionsArr as $transactionKey => $transaction) {
                     $balance = numberFormatPrecision($balance + $transaction['amount']);
 
-                    $transactions[$transaction['id']] = $transaction;
+                    $transactions['"' . $transaction['id'] . '"'] = $transaction;//Quotes will maintain the sequence, else json will sort it again in JS
                 }
 
                 $responseData['balance'] = $balance;
