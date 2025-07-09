@@ -2,6 +2,7 @@
 
 namespace Apps\Fintech\Packages\Accounting\Transactions;
 
+use Apps\Fintech\Packages\Accounting\Accounts\AccountingAccounts;
 use Apps\Fintech\Packages\Accounting\Accounts\Model\AppsFintechAccountingAccounts;
 use Apps\Fintech\Packages\Accounting\Books\AccountingBooks;
 use Apps\Fintech\Packages\Accounting\Transactions\Model\AppsFintechAccountingTransactions;
@@ -31,18 +32,64 @@ class AccountingTransactions extends BasePackage
 
     public function addAccountingTransaction($data)
     {
+        if (!$this->checkBook($data)) {
+            return false;
+        }
+
         if (isset($data['clone']) && $data['clone'] == 'true') {
             $accountingtransaction = $this->getById($data['id']);
-
             $accountingtransaction['clone'] = false;
             $accountingtransaction['sequence'] = 99;
             $accountingtransaction['attachments'] = [];
-            unset($accountingtransaction['id']);
 
-            if (!$this->addAccountingTransaction($accountingtransaction)) {
-                $this->addResponse('Error cloning transaction', 1);
+            if (isset($data['is_split']) && $data['is_split'] == 'true' ||
+                $accountingtransaction['is_split'] == true//if in case we are cloning a split transaction via destination account
+            ) {
+                $data['clone'] = false;
 
-                return false;
+                if ($accountingtransaction['is_split'] == true) {
+                    $rootTransactions = $this->getAccountTransactions([
+                        'book_id'           => $accountingtransaction['book_id'],
+                        'transaction_uuid'  => $accountingtransaction['uuid'],
+                        'is_split'          => 'false',
+                    ]);
+
+                    if ($rootTransactions && isset($rootTransactions['transactions']) && count($rootTransactions['transactions']) === 1) {
+                        if ($this->helper->first($rootTransactions['transactions'])['dr_accounts_uuid'] === 'split' ||
+                            $this->helper->first($rootTransactions['transactions'])['cr_accounts_uuid'] === 'split'
+                        ) {
+                            $data['is_split'] = 'true';
+                            $data['split_id'] = $data['id'];
+                            $data['id'] = $this->helper->first($rootTransactions['transactions'])['id'];
+                        }
+                    }
+
+                    if (!$this->addAccountingTransaction($data)) {
+                        return false;
+                    }
+
+                    $this->getAccountTransactions([
+                        'book_id'           => $data['book_id'],
+                        'accounts_uuid'     => $data['accounts_uuid'],
+                        'is_split'          => 'false',
+                    ]);
+
+                    return true;
+                }
+
+                if (!$this->addAccountingTransaction($data)) {
+                    return false;
+                }
+
+                return true;
+            } else {
+                unset($accountingtransaction['id']);
+
+                if (!$this->addAccountingTransaction($accountingtransaction)) {
+                    $this->addResponse('Error cloning transaction', 1);
+
+                    return false;
+                }
             }
 
             $clonedAccountTransaction = $this->packagesData->last;
@@ -135,15 +182,28 @@ class AccountingTransactions extends BasePackage
                     return false;
                 }
 
-                $newSplitAccountingTransaction = $accountingtransaction;
+                if (isset($data['split_id'])) {
+                    if (!isset($accountingtransactions['transactions']['"' . $data['split_id'] . '"'])) {
+                        $this->addResponse('Split transaction not found!', 1);
+
+                        return false;
+                    }
+
+                    $newSplitAccountingTransaction = $accountingtransactions['transactions']['"' . $data['split_id'] . '"'];
+                } else {
+                    $newSplitAccountingTransaction = $accountingtransaction;
+                }
+
                 $newSplitAccountingTransaction['dr_accounts_uuid'] = $data['dr_accounts_uuid'];
+                $newSplitAccountingTransaction['cr_accounts_uuid'] = $data['cr_accounts_uuid'];
                 $newSplitAccountingTransaction['sequence'] = $data['sequence'];
                 $newSplitAccountingTransaction['description'] = $data['description'];
                 $newSplitAccountingTransaction['amount'] = $data['amount'];
                 $newSplitAccountingTransaction['has_splits'] = false;
                 $newSplitAccountingTransaction['is_split'] = true;
+
                 unset($newSplitAccountingTransaction['id']);
-                // trace([$data]);
+
                 if ($this->add($newSplitAccountingTransaction)) {
                     $accountingtransaction['has_splits'] = true;
 
@@ -193,7 +253,17 @@ class AccountingTransactions extends BasePackage
 
     public function updateAccountingTransaction($data)
     {
+        if (!$this->checkBook($data)) {
+            return false;
+        }
+
         $accountingtransaction = $this->getById($data['id']);
+
+        if (!$accountingtransaction) {
+            $this->addResponse('Transaction with ID not found', 1);
+
+            return false;
+        }
 
         if (isset($data['is_split']) && isset($data['split_id'])) {
             $accountingSplitTransactions = $this->getAccountTransactions([
@@ -204,7 +274,8 @@ class AccountingTransactions extends BasePackage
             ]);
 
             if (count($accountingSplitTransactions['transactions']) > 0) {
-                $accountingSplitTransactions['balance'] = $accountingSplitTransactions['balance'] - $accountingSplitTransactions['transactions'][$data['split_id']]['amount'];
+                $accountingSplitTransactions['balance'] =
+                    $accountingSplitTransactions['balance'] - $accountingSplitTransactions['transactions']['"' . $data['split_id'] . '"']['amount'];
             }
 
             if ($accountingSplitTransactions['balance'] + (float) $data['amount'] > (float) $accountingtransaction['amount']) {
@@ -218,12 +289,6 @@ class AccountingTransactions extends BasePackage
             $accountingtransaction = $this->getById($data['id']);//Get Split Transaction
         }
 
-        if (!$accountingtransaction) {
-            $this->addResponse('Transaction with ID not found', 1);
-
-            return false;
-        }
-
         if (isset($data['removeAttachment']) && isset($data['attachmentUUID'])) {
             $key = array_search($data['attachmentUUID'], $accountingtransaction['attachments']);
 
@@ -234,7 +299,24 @@ class AccountingTransactions extends BasePackage
             }
         }
 
+        if ($accountingtransaction['has_splits'] &&
+            $accountingtransaction['cr_accounts_uuid'] !== $data['cr_accounts_uuid']
+        ) {
+            $this->addResponse('Cannot change transaction type for split transactions', 1);
+
+            return false;
+        }
+
+        $transactionIsSplit = false;
+        if ($accountingtransaction['is_split'] && !$accountingtransaction['has_splits']) {
+            $transactionIsSplit = true;
+        }
+
         $accountingtransaction = array_merge($accountingtransaction, $data);
+
+        if ($transactionIsSplit && isset($data['is_split']) && $data['is_split'] == 'false') {
+            $accountingtransaction['is_split'] = 'true';
+        }
 
         if ($this->update($accountingtransaction)) {
             if (isset($data['status'])) {
@@ -288,6 +370,41 @@ class AccountingTransactions extends BasePackage
         return false;
     }
 
+    protected function checkBook($data)
+    {
+        $bookPackage = $this->usePackage(AccountingBooks::class);
+
+        $book = $bookPackage->getById((int) $data['book_id']);
+
+        if (!$book) {
+            $this->addResponse('Book with ID not found', 1);
+
+            return false;
+        }
+
+        if ($book['status'] === 'close') {
+            $this->addResponse('Book is closed! Transactions are read only.', 1);
+
+            return false;
+        }
+
+        if (isset($book['fy_end_date']) && $book['fy_end_date'] !== '') {
+            try {
+                $fyEndDate = \Carbon\Carbon::parse($book['fy_end_date']);
+
+                if ($fyEndDate->lt(\Carbon\Carbon::now())) {
+                    $this->addResponse('Transaction date is beyond book fy end date.', 1);
+
+                    return false;
+                }
+            } catch (\throwable $e) {
+                return true;
+            }
+        }
+
+        return true;
+    }
+
     public function removeAccountingTransaction($data)
     {
         $accountingtransaction = $this->getById($data['id']);
@@ -336,7 +453,7 @@ class AccountingTransactions extends BasePackage
             return true;
         } else {
             if ($this->remove($accountingtransaction['id'])) {
-                if ($accountingtransaction['is_split']) {
+                if ($accountingtransaction['is_split'] && isset($data['is_split']) && $data['is_split'] == 'true') {
                     $data['transaction_uuid'] = $accountingtransaction['uuid'];
                 }
 
@@ -361,6 +478,12 @@ class AccountingTransactions extends BasePackage
 
         if (!$book) {
             $this->addResponse('Book with ID not found', 1);
+
+            return false;
+        }
+
+        if ($book['status'] === 'close') {
+            $this->addResponse('Book is closed! Transactions are read only.', 1);
 
             return false;
         }
@@ -426,7 +549,7 @@ class AccountingTransactions extends BasePackage
                 unset($data['reconcile_ending_balance']);
                 unset($data['transaction_ids']);
                 $data['is_split'] = 'false';
-                // trace([$data]);
+
                 $this->getAccountTransactions($data);
 
                 return true;
@@ -447,6 +570,23 @@ class AccountingTransactions extends BasePackage
 
     public function getAccountTransactions($data)
     {
+        if (isset($data['accounts_uuid'])) {
+            $accountsPackage = $this->usePackage(AccountingAccounts::class);
+            $account = $accountsPackage->getAccountingAccountByUUID($data['accounts_uuid']);
+
+            if (!$account) {
+                $this->addResponse('Account with UUID not found', 1);
+
+                return false;
+            }
+
+            $accountBalanceTypes = $accountsPackage->getAvailableAccountTypes(true);
+            $crBalance = 'positive';
+            if (isset($accountBalanceTypes[$account['type']])) {
+                $crBalance = $accountBalanceTypes[$account['type']];
+            }
+        }
+
         if ($this->config->databasetype === 'db') {
             if (isset($data['transaction_uuid'])) {
                 $conditions =
@@ -548,27 +688,73 @@ class AccountingTransactions extends BasePackage
                 'balances' => [],
             ];
 
-        // trace([$data, $transactionsArr]);
-
         if ($transactionsArr && count($transactionsArr) > 0) {
             $balance = 0;
             $unreconciledBalance = 0;
 
             $transactions = [];
-            // trace([$data]);
+
             if (!isset($data['transaction_uuid']) &&
-                // !isset($data['not_reconciled']) &&
                 (isset($data['is_split']) && $data['is_split'] == 'false')
             ) {
-                // trace([$data, $transactionsArr]);
                 $balances = [];
                 $lastReconciledDate = null;
                 $lastReconciledBalance = 0;
                 $transactionType = null;
 
-                // trace([$transactionsArr]);
+                $splitRootTransactions = [];
+                //This loop is important for split transactions.
+                foreach ($transactionsArr as $transactionKey => $transaction) {
+                    if ($transaction['has_splits']) {
+                        array_push($splitRootTransactions, $transaction['id']);
+                    }
+                }
+
+                // trace([$splitRootTransactions, $transactionsArr]);
                 foreach ($transactionsArr as $transactionKey => $transaction) {
                     if (!isset($data['not_reconciled'])) {
+                        if ($transaction['is_split']) {
+                            // continue;
+                            if ($transaction['cr_accounts_uuid'] === $data['accounts_uuid'] ||
+                                $transaction['dr_accounts_uuid'] === $data['accounts_uuid']
+                            ) {
+                                $rootTransactions = $this->getAccountTransactions([
+                                    "book_id"           => $data['book_id'],
+                                    "accounts_uuid"     => $data['accounts_uuid'],
+                                    'transaction_uuid'  => $transaction['uuid'],
+                                    "is_split"          => 'false'
+                                ]);
+
+                                // trace([$transaction, $rootTransactions]);
+                                if ($rootTransactions && isset($rootTransactions['transactions']) && count($rootTransactions['transactions']) === 1) {
+                                    if (in_array($this->helper->first($rootTransactions['transactions'])['id'], $splitRootTransactions)) {
+                                        continue;
+                                    }
+                                    // // continue;
+                                    // foreach ($rootTransactions['transactions'] as $rootTransaction) {
+                                    //     if ($rootTransaction['has_splits']) {
+                                    //         if (in_array($rootTransaction['id'], $splitRootTransactions)) {
+                                    //             continue 1;
+                                    //         }
+                                    //         // $rootTransaction['amount'] = $transaction['amount'];
+                                    //         // trace([$rootTransaction, $transaction]);
+                                    //         // $transaction = $rootTransaction;
+                                    //         // break;
+                                    //         // continue 1;
+                                    //     }
+                                    // }
+                                }
+                            // } else if ($transaction['dr_accounts_uuid'] !== $data['accounts_uuid']) {
+                            //     continue;
+                            }
+                            // // trace([$data, $transaction]);
+                            // if ($transaction['dr_accounts_uuid'] !== $data['accounts_uuid'] ||
+                            //     $transaction['cr_accounts_uuid'] !== $data['accounts_uuid']
+                            // ) {
+                            //     continue;
+                            // }
+                        }
+
                         if ($transaction['attachments'] && count($transaction['attachments']) > 0) {
                             $attachments = [];
 
@@ -582,17 +768,17 @@ class AccountingTransactions extends BasePackage
                                 $transaction['attachments'] = null;
                             }
                         }
-                        if ($transaction['is_split']) {
-                            if ($transaction['dr_accounts_uuid'] !== $data['accounts_uuid']) {
-                                continue;
-                            }
-                        }
                     }
 
                     if ($data['accounts_uuid'] === $transaction['dr_accounts_uuid'] ||
                         $transaction['cr_accounts_uuid'] === 'split'
                     ) {
-                        $transaction['balance'] = $balance = numberFormatPrecision($balance + $transaction['amount']);
+                        if ($crBalance === 'positive') {
+                            $transaction['balance'] = $balance = numberFormatPrecision($balance - $transaction['amount']);
+                        } else if ($crBalance === 'negative') {
+                            $transaction['balance'] = $balance = numberFormatPrecision($balance + $transaction['amount']);
+                        }
+
                         $transactionType = 'dr';
 
                         if (!isset($data['not_reconciled']) && $transaction['cr_accounts_uuid'] === 'split') {
@@ -616,7 +802,12 @@ class AccountingTransactions extends BasePackage
                     } else if ($data['accounts_uuid'] === $transaction['cr_accounts_uuid'] ||
                                $transaction['dr_accounts_uuid'] === 'split'
                     ) {
-                        $transaction['balance'] = $balance = numberFormatPrecision($balance - $transaction['amount']);
+                        if ($crBalance === 'positive') {
+                            $transaction['balance'] = $balance = numberFormatPrecision($balance + $transaction['amount']);
+                        } else if ($crBalance === 'negative') {
+                            $transaction['balance'] = $balance = numberFormatPrecision($balance - $transaction['amount']);
+                        }
+
                         $transactionType = 'cr';
 
                         if (!isset($data['not_reconciled']) && $transaction['dr_accounts_uuid'] === 'split') {
@@ -683,16 +874,13 @@ class AccountingTransactions extends BasePackage
                     }
                 }
 
-                // if (!isset($data['not_reconciled'])) {
-                    // trace([$transactions]);
-                // }
                 $responseData['balance'] = $balance;
                 $responseData['unreconciled_balance'] = $unreconciledBalance;
                 $responseData['last_reconciled_date'] = $lastReconciledDate;
                 $responseData['last_reconciled_balance'] = $lastReconciledBalance;
                 $responseData['balances'] = $balances;
                 $responseData['transactions'] = $transactions;
-
+                // trace([$transactions]);
                 $accountsModel = new AppsFintechAccountingAccounts;
 
                 if ($this->config->databasetype === 'db') {
@@ -743,11 +931,6 @@ class AccountingTransactions extends BasePackage
         $this->addResponse('No transactions found', 0, $responseData);
 
         return $responseData;
-    }
-
-    public function getAccountTransactionViaUUID($uuid)
-    {
-        //
     }
 
     protected function fillBalanceDays(&$balances, $transaction, $nextTransaction)
