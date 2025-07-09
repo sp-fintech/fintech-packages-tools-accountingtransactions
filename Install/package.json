@@ -5,7 +5,7 @@
 	"module_type" : "packages",
 	"app_type" : "fintech",
 	"category" : "tools",
-	"version" : "0.1.0",
+	"version" : "0.2.0",
 	"repo" : "https://github.com/sp-fintech/fintech-packages-tools-accountingtransactions",
 	"class" : "Apps\\Fintech\\Packages\\Accounting\\Transactions\\AccountingTransactions",
 	"dependencies" : 
